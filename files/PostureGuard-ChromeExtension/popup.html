@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostureGuard</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@700&display=swap');
+    
+    :root {
+      --bg: #0f1117;
+      --card: #181b24;
+      --card-hover: #1e222e;
+      --border: #2a2e3b;
+      --text: #e4e6ed;
+      --text-dim: #8b8fa3;
+      --accent: #6ee7b7;
+      --accent-soft: rgba(110, 231, 183, 0.12);
+      --warn: #fbbf24;
+      --warn-soft: rgba(251, 191, 36, 0.12);
+      --danger: #f87171;
+      --danger-soft: rgba(248, 113, 113, 0.12);
+      --blue: #60a5fa;
+      --blue-soft: rgba(96, 165, 250, 0.12);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 360px;
+      min-height: 480px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'DM Sans', sans-serif;
+      overflow-x: hidden;
+    }
+
+    .header {
+      padding: 20px 20px 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, #6ee7b7, #3b82f6);
+      border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+
+    .header-text h1 {
+      font-family: 'Space Mono', monospace;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .header-text p {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 1px;
+    }
+
+    .status-strip {
+      margin: 16px 20px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .status-strip.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid rgba(110, 231, 183, 0.2);
+    }
+
+    .status-strip.inactive {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border: 1px solid rgba(248, 113, 113, 0.15);
+    }
+
+    .pulse {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.4); }
+    }
+
+    .cards { padding: 0 20px; display: flex; flex-direction: column; gap: 10px; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      transition: background 0.2s;
+    }
+
+    .card:hover { background: var(--card-hover); }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+
+    .card-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-dim);
+    }
+
+    .card-icon {
+      font-size: 18px;
+    }
+
+    .card-value {
+      font-size: 28px;
+      font-weight: 700;
+      font-family: 'Space Mono', monospace;
+      line-height: 1;
+    }
+
+    .card-sub {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-top: 6px;
+    }
+
+    /* Posture indicator */
+    .posture-good { color: var(--accent); }
+    .posture-bad { color: var(--danger); }
+    .posture-unknown { color: var(--text-dim); }
+
+    /* Water progress */
+    .water-bar-track {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+
+    .water-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--blue), #a78bfa);
+      border-radius: 3px;
+      transition: width 0.4s ease;
+    }
+
+    /* Buttons */
+    .actions {
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 12px;
+      padding: 14px;
+      font-family: 'DM Sans', sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #6ee7b7, #3b82f6);
+      color: #0f1117;
+    }
+
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+
+    .btn-secondary {
+      background: var(--card);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover { background: var(--card-hover); }
+
+    .btn-water {
+      background: var(--blue-soft);
+      color: var(--blue);
+      border: 1px solid rgba(96, 165, 250, 0.2);
+    }
+
+    .btn-water:hover { background: rgba(96, 165, 250, 0.2); }
+
+    .btn-stop {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border: 1px solid rgba(248, 113, 113, 0.2);
+    }
+
+    .btn-stop:hover { background: rgba(248, 113, 113, 0.2); }
+
+    .btn-row { display: flex; gap: 8px; }
+    .btn-row .btn { flex: 1; }
+
+    /* Settings */
+    .settings { padding: 0 20px 20px; }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .setting-row:last-child { border-bottom: none; }
+
+    .setting-label {
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    .setting-value {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .setting-value select,
+    .setting-value input {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-family: 'DM Sans', sans-serif;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .setting-value select:focus,
+    .setting-value input:focus {
+      border-color: var(--accent);
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-dim);
+      padding: 16px 20px 8px;
+    }
+
+    .footer {
+      padding: 12px 20px 16px;
+      text-align: center;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    .footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="logo">🦴</div>
+    <div class="header-text">
+      <h1>PostureGuard</h1>
+      <p>Webcam posture & wellness tracker</p>
+    </div>
+  </div>
+
+  <!-- Status -->
+  <div id="statusStrip" class="status-strip inactive">
+    <div class="pulse"></div>
+    <span id="statusText">Monitoring inactive</span>
+  </div>
+
+  <!-- Metric Cards -->
+  <div class="cards">
+    <!-- Posture -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">Current Posture</span>
+        <span class="card-icon">🪑</span>
+      </div>
+      <div id="postureValue" class="card-value posture-unknown">--</div>
+      <div id="postureSub" class="card-sub">Start monitoring to track</div>
+    </div>
+
+    <!-- Sitting Duration -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">Sitting Duration</span>
+        <span class="card-icon">⏱️</span>
+      </div>
+      <div id="sittingValue" class="card-value">00:00</div>
+      <div id="sittingSub" class="card-sub">Next stretch break: --</div>
+    </div>
+
+    <!-- Water Intake -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-label">Water Intake</span>
+        <span class="card-icon">💧</span>
+      </div>
+      <div id="waterValue" class="card-value"><span id="waterCount">0</span><span style="font-size:16px;color:var(--text-dim)"> / <span id="waterGoal">8</span></span></div>
+      <div class="card-sub">glasses today</div>
+      <div class="water-bar-track">
+        <div id="waterBar" class="water-bar-fill" style="width: 0%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="actions">
+    <button id="btnMonitor" class="btn btn-primary">
+      🎥 Open Monitor Dashboard
+    </button>
+    <div class="btn-row">
+      <button id="btnWater" class="btn btn-water">💧 Log Water</button>
+      <button id="btnStop" class="btn btn-stop hidden">⏹ Stop</button>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="section-title">Settings</div>
+  <div class="settings">
+    <div class="setting-row">
+      <span class="setting-label">Water reminder</span>
+      <div class="setting-value">
+        <select id="waterInterval">
+          <option value="30">30 min</option>
+          <option value="45">45 min</option>
+          <option value="60" selected>60 min</option>
+          <option value="90">90 min</option>
+        </select>
+      </div>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">Stretch reminder</span>
+      <div class="setting-value">
+        <select id="stretchInterval">
+          <option value="20">20 min</option>
+          <option value="30" selected>30 min</option>
+          <option value="45">45 min</option>
+          <option value="60">60 min</option>
+        </select>
+      </div>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">Daily water goal</span>
+      <div class="setting-value">
+        <input id="goalInput" type="number" min="1" max="20" value="8" style="width:60px;text-align:center">
+        <span style="font-size:12px;color:var(--text-dim)">glasses</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    PostureGuard v1.0 · Your health, your data, your device
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
