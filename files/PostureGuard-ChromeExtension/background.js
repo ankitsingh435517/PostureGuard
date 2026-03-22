@@ -56,10 +56,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delayInMinutes: msg.waterInterval || 60,
       periodInMinutes: msg.waterInterval || 60,
     });
-    chrome.alarms.create('stretch-reminder', {
-      delayInMinutes: msg.stretchInterval || 30,
-      periodInMinutes: msg.stretchInterval || 30,
-    });
+    // Stretch reminders are fired immediately by monitor.js when the timer cycles
+    // (pause-aware). No Chrome alarm needed for stretch.
     sendResponse({ ok: true });
   }
 
@@ -93,6 +91,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       iconUrl: 'icons/icon128.png',
       title: '⚠️ Posture Alert!',
       message: msg.detail || 'Straighten up! Your posture needs correction.',
+      priority: 2,
+    });
+    sendResponse({ ok: true });
+  }
+
+  if (msg.type === 'STRETCH_NOW') {
+    const sittingMin = msg.sittingMin || 0;
+    chrome.notifications.create('stretch-' + Date.now(), {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: '🧘 Stretch Break!',
+      message: `You've been sitting for ${sittingMin} min. Stand up, roll your shoulders, stretch your neck!`,
       priority: 2,
     });
     sendResponse({ ok: true });

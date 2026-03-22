@@ -1,14 +1,21 @@
-// ── PostureGuard Monitor v2 ──
-// Fixes: lower thresholds, in-page alerts, audio beep, debug panel, better detection
+// ── PostureGuard Monitor v3 ──
+// Hybrid detection: tinyFaceDetector (face box slouch) + MediaPipe Pose (shoulders/body)
 
 const $ = (id) => document.getElementById(id);
 
 // ═══ CONFIG ═══
 const CONFIG = {
-  SLOUCH_THRESHOLD: 10,      // % of face height (distance-invariant)
-  LEAN_FORWARD_THRESHOLD: 12,
-  LEAN_BACK_THRESHOLD: 18,   // % face size decrease = leaning back
-  SIDE_LEAN_THRESHOLD: 8,    // % of face width (distance-invariant)
+  // MediaPipe body thresholds (shoulder-width units, scale-invariant)
+  SLOUCH_THRESHOLD: 0.15,
+  SIDE_LEAN_THRESHOLD: 0.12,
+  FORWARD_HEAD_THRESHOLD: 0.20,
+  SHOULDER_ROUND_THRESHOLD: 0.10,
+  // Face-based thresholds
+  FACE_SLOUCH_THRESHOLD: 0.10,   // face drops relative to shoulders (normalised by shoulder width)
+  FACE_TURN_THRESHOLD: 0.15,     // face X deviation as fraction of face width — suppresses slouch check when turned
+  // General
+  MIN_SHOULDER_WIDTH: 0.12,     // shoulder width below this → too far from camera
+  MAX_SHOULDER_DRIFT: 0.6,      // >60% width change from calibration → different person, ignore
   ALERT_COOLDOWN_MS: 10000,
   BAD_POSTURE_DELAY_MS: 1500,
   DETECTION_INTERVAL_MS: 300,
@@ -23,6 +30,7 @@ let state = {
   detector: null,
   detectionTimer: null,
   calibration: null,
+  calibrations: { sitting: null },
   currentPosture: 'unknown',
   badPostureSince: null,
   lastAlertTime: 0,
@@ -34,6 +42,8 @@ let state = {
   logs: [],
   alertSound: null,
   detectionMethod: 'none',
+  faceReady: false,
+  _lastStretchCycle: 0,
 };
 
 // ═══ AUDIO BEEP ═══
@@ -65,89 +75,227 @@ function playAlertBeeps() {
   setTimeout(() => playBeep(520, 0.25), 400);
 }
 
-// ═══ FACE DETECTOR (face-api.js TinyFaceDetector) ═══
-let faceApiReady = false;
+// ═══ POSE DETECTOR (MediaPipe Pose Landmarker) ═══
+// 33 body landmarks — shoulders, hips, nose used for posture analysis
+let poseDetector = null;
+let poseReady = false;
+let lastPose = null;
 
 async function initDetector() {
-  if (typeof faceapi === 'undefined') {
+  if (typeof Pose === 'undefined') {
     state.detectionMethod = 'none';
-    addLog('❌', 'face-api.js not loaded — check libs/face-api.min.js');
+    addLog('❌', 'MediaPipe Pose not loaded — check mediapipe/pose.js');
     return;
   }
   try {
-    // TF.js internally fetches with mode:'cors' which fails for chrome-extension:// URLs.
-    // Instead, fetch files ourselves (no CORS restriction for extension pages accessing
-    // their own resources), then load the weight map directly into the network.
-    const base = chrome.runtime.getURL('models');
-    const [manifestRes, shardRes] = await Promise.all([
-      fetch(`${base}/tiny_face_detector_model-weights_manifest.json`),
-      fetch(`${base}/tiny_face_detector_model-shard1`),
-    ]);
-    if (!manifestRes.ok) throw new Error(`Manifest: HTTP ${manifestRes.status}`);
-    if (!shardRes.ok) throw new Error(`Weights: HTTP ${shardRes.status}`);
+    poseDetector = new Pose({
+      locateFile: (file) => chrome.runtime.getURL(`mediapipe/${file}`),
+    });
 
-    const manifest = await manifestRes.json();
-    const shardBuffer = await shardRes.arrayBuffer();
+    poseDetector.setOptions({
+      modelComplexity: 0,          // lite — fastest, sufficient for posture
+      smoothLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
 
-    // faceapi re-exports all TF.js core functions including io.decodeWeights
-    const weightMap = faceapi.tf.io.decodeWeights(shardBuffer, manifest[0].weights);
-    await faceapi.nets.tinyFaceDetector.loadFromWeightMap(weightMap);
+    // onResults fires before send() resolves — safe to read lastPose after await
+    poseDetector.onResults((results) => {
+      lastPose = results.poseLandmarks || null;
+    });
 
-    faceApiReady = true;
-    state.detectionMethod = 'face-api.js (TinyFaceDetector)';
-    addLog('✅', 'ML face detection ready');
+    // Warm-up: triggers model load now so first real detection isn't slow
+    const video = $('webcam');
+    if (video && video.readyState >= 2) await poseDetector.send({ image: video });
+
+    poseReady = true;
+    state.detectionMethod = 'MediaPipe Pose Landmarker';
+    addLog('✅', 'Pose detection ready — 33 body landmarks active');
   } catch (err) {
-    faceApiReady = false;
+    poseReady = false;
     state.detectionMethod = 'none';
-    addLog('❌', `Model load failed: ${err.message}`);
+    addLog('❌', `Pose init failed: ${err.message}`);
     console.error('initDetector error:', err);
   }
 }
 
-async function detectFace(video) {
-  if (!faceApiReady || video.readyState < 2) return null;
+async function detectPose(video) {
+  if (!poseReady || !poseDetector || video.readyState < 2) return null;
   try {
-    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
-    const detection = await faceapi.detectSingleFace(video, options);
-    if (!detection) return null;
-    const box = detection.box;
-    return {
-      x: box.x, y: box.y, width: box.width, height: box.height,
-      centerX: box.x + box.width / 2,
-      centerY: box.y + box.height / 2,
-      confidence: detection.score > 0.75 ? 'high' : 'low',
-    };
-  } catch (err) {
+    lastPose = undefined;
+    await poseDetector.send({ image: video });
+    return lastPose ?? null;
+  } catch (_) {
     return null;
   }
 }
 
-// ═══ POSTURE ANALYSIS ═══
-function analyzePosture(face) {
-  if (!state.calibration || !face) return { status: 'unknown' };
-  const cal = state.calibration;
+// ═══ FACE DETECTOR (tinyFaceDetector via face-api.js) ═══
+async function initFaceDetector() {
+  if (typeof faceapi === 'undefined') {
+    addLog('⚠️', 'face-api.js not loaded — face-based slouch detection disabled');
+    return;
+  }
+  try {
+    // TF.js's internal HTTP handler fails for chrome-extension:// URLs in MV3.
+    // Fix: fetch model files ourselves (always works from extension pages),
+    // decode weights manually, and load directly via loadFromWeightMap.
+    const base = chrome.runtime.getURL('models');
 
-  // Normalize by face dimensions (not frame size) so detection is distance-invariant.
-  // A lean of the same angle triggers at any distance from the camera.
-  const yDev = ((face.centerY - cal.centerY) / cal.faceHeight) * 100;
-  const sizeDev = ((face.width - cal.faceWidth) / cal.faceWidth) * 100;
-  const xDev = ((face.centerX - cal.centerX) / cal.faceWidth) * 100;
+    const manifest = await fetch(`${base}/tiny_face_detector_model-weights_manifest.json`)
+      .then(r => r.json());
+
+    const shardBuffers = await Promise.all(
+      manifest[0].paths.map(p => fetch(`${base}/${p}`).then(r => r.arrayBuffer()))
+    );
+
+    // Concatenate shards into one ArrayBuffer (model has a single shard)
+    const totalBytes = shardBuffers.reduce((s, b) => s + b.byteLength, 0);
+    const combined   = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const buf of shardBuffers) { combined.set(new Uint8Array(buf), off); off += buf.byteLength; }
+
+    const weightMap = faceapi.tf.io.decodeWeights(combined.buffer, manifest[0].weights);
+    await faceapi.nets.tinyFaceDetector.loadFromWeightMap(weightMap);
+
+    state.faceReady = true;
+    state.detectionMethod = 'MediaPipe Pose + TinyFaceDetector';
+    addLog('✅', 'Face detector ready — hybrid mode active');
+  } catch (err) {
+    addLog('⚠️', `Face detector init failed: ${err.message} — using pose-only mode`);
+    console.error('[PostureGuard] Face detector:', err);
+  }
+}
+
+async function detectFaceBox(video) {
+  if (!state.faceReady || video.readyState < 2) return null;
+  try {
+    return await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()) ?? null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ═══ FACE POSTURE ANALYSIS ═══
+// Uses tinyFaceDetector bounding box + MediaPipe shoulder landmarks.
+// Key signal: (shoulderMidY - faceCenterY) / shoulderWidth
+//   — camera-distance invariant because both face and shoulders scale together
+//   — cannot be fooled by leaning back: face width shrinks AND shoulder width shrinks proportionally
+// Head turns (looking at phone etc.) suppress the slouch check rather than triggering an alert.
+function analyzeFace(det, landmarks) {
+  if (!det || !state.calibration?.faceCal) return { issues: [], faceMetrics: {} };
+  const cal = state.calibration.faceCal;
+
+  const box = det.box; // { x, y, width, height } in pixel space
+  const video = $('webcam');
+  const vw = video.videoWidth  || 640;
+  const vh = video.videoHeight || 480;
+
+  // Normalise face box to [0,1] space to match MediaPipe landmark coordinates
+  const faceCenterYn = (box.y + box.height / 2) / vh;
+  const faceCenterXn = (box.x + box.width  / 2) / vw;
+  const faceWidthn   = box.width / vw;
+
+  const ls = landmarks[11], rs = landmarks[12];
+  const shoulderMidY  = (ls.y + rs.y) / 2;
+  const shoulderWidth = Math.abs(rs.x - ls.x) || 0.01;
+
+  // Head turn: face X deviates from calibrated centre (normalised by face width)
+  const turnDev = Math.abs(faceCenterXn - cal.faceCenterX) / (faceWidthn || 0.01);
+  const isTurned = turnDev > CONFIG.FACE_TURN_THRESHOLD;
+
+  // Slouch: face centre drops toward shoulders relative to calibration
+  // Skip when head is turned — the box shifts and would give a false reading
+  const faceToShoulderRatio = (shoulderMidY - faceCenterYn) / shoulderWidth;
+  const slouchDev = isTurned ? 0 : cal.faceToShoulderRatio - faceToShoulderRatio;
 
   const issues = [];
-  if (yDev > CONFIG.SLOUCH_THRESHOLD) issues.push('Slouching — sit upright');
-  if (sizeDev > CONFIG.LEAN_FORWARD_THRESHOLD) issues.push('Too close — sit back');
-  if (sizeDev < -CONFIG.LEAN_BACK_THRESHOLD) issues.push('Leaning back — sit upright');
-  if (Math.abs(xDev) > CONFIG.SIDE_LEAN_THRESHOLD) issues.push(`Leaning ${xDev > 0 ? 'right' : 'left'} — center yourself`);
+  if (slouchDev > CONFIG.FACE_SLOUCH_THRESHOLD) issues.push('Slouching — sit upright');
+
+  return {
+    issues,
+    faceMetrics: {
+      faceSlouchDev: +slouchDev.toFixed(3),
+      faceTurnDev:   +turnDev.toFixed(3),
+    },
+    isTurned,
+  };
+}
+
+// ═══ POSTURE ANALYSIS ═══
+// landmarks[0]=nose  [7]=leftEar  [8]=rightEar
+// landmarks[11]=leftShoulder  [12]=rightShoulder
+// landmarks[23]=leftHip       [24]=rightHip
+// All coords normalized 0-1; Y increases downward; Z negative = closer to camera
+function analyzePosture(landmarks) {
+  if (!state.calibration || !landmarks) return { status: 'unknown' };
+  const cal = state.calibration;
+
+  const nose = landmarks[0];
+  const ls   = landmarks[11]; // left shoulder
+  const rs   = landmarks[12]; // right shoulder
+  const lh   = landmarks[23]; // left hip
+  const rh   = landmarks[24]; // right hip
+
+  if ((ls.visibility ?? 1) < 0.5 || (rs.visibility ?? 1) < 0.5) return { status: 'unknown' };
+
+  const shoulderMidY  = (ls.y + rs.y) / 2;
+  const shoulderMidZ  = (ls.z + rs.z) / 2;
+  const shoulderWidth = Math.abs(rs.x - ls.x) || 0.01;
+
+  // 1. Shoulder tilt — side lean
+  const shoulderTilt    = (ls.y - rs.y) / shoulderWidth;
+  const shoulderTiltDev = Math.abs(shoulderTilt - cal.shoulderTilt);
+
+  // 2. Forward head — nose z relative to shoulders
+  const headForwardZ   = (shoulderMidZ - nose.z) / shoulderWidth;
+  const headForwardDev = headForwardZ - cal.headForwardZ;
+
+  // 3. Shoulder drop — shoulders physically sink in the frame when slouching.
+  //    Directly tracks shoulder Y against calibrated good-posture shoulder Y.
+  //    When head-to-shoulder ratio stays constant (both sink together), this still fires.
+  const shoulderDrop = (shoulderMidY - cal.shoulderMidY) / cal.shoulderWidth; // positive = dropped
+
+  // 4. Torso compression (bonus check when hips are visible)
+  const hipsVisible = (lh.visibility ?? 0) > 0.3 && (rh.visibility ?? 0) > 0.3;
+  const hipMidY     = hipsVisible ? (lh.y + rh.y) / 2 : null;
+  const torsoRatio  = hipMidY !== null ? (hipMidY - shoulderMidY) / shoulderWidth : null;
+  const torsoSlouchDev = torsoRatio !== null ? cal.torsoRatio - torsoRatio : 0;
+
+  // Use whichever slouch signal is strongest
+  const slouchDev = Math.max(shoulderDrop, torsoSlouchDev);
+
+  // 5. Shoulder rounding — catches natural back slouch (spine curves, head stays upright).
+  //    Uses ear-to-shoulder Z offset: when shoulders round forward, they push toward the
+  //    camera while ears stay back, increasing (earMidZ - shoulderMidZ).
+  //    This is camera-distance invariant — moving back shifts both ear and shoulder Z equally
+  //    so the difference stays constant. Only actual shoulder rounding changes it.
+  //    Guard: skip if calibration predates this field.
+  let shoulderRoundScore = 0;
+  if (cal.earShoulderZDiff !== undefined) {
+    const le = landmarks[7]; // left ear
+    const re = landmarks[8]; // right ear
+    const earMidZ = (le.z + re.z) / 2;
+    const earShoulderZDiff = (earMidZ - shoulderMidZ) / shoulderWidth; // positive = ear behind shoulders
+    shoulderRoundScore = earShoulderZDiff - cal.earShoulderZDiff;      // positive = shoulders rounded forward vs calibration
+  }
+
+  const issues = [];
+  if (slouchDev          > CONFIG.SLOUCH_THRESHOLD)        issues.push('Slouching — sit upright');
+  if (shoulderTiltDev    > CONFIG.SIDE_LEAN_THRESHOLD)     issues.push('Shoulders uneven — level up');
+  if (headForwardDev     > CONFIG.FORWARD_HEAD_THRESHOLD)  issues.push('Head forward — pull back');
+  if (shoulderRoundScore > CONFIG.SHOULDER_ROUND_THRESHOLD) issues.push('Back rounded — open your chest');
 
   return {
     status: issues.length > 0 ? 'bad' : 'good',
     issues,
     metrics: {
-      headPos: Math.round(yDev * 10) / 10,
-      bodyLean: Math.round(xDev * 10) / 10,
-      distance: Math.round(sizeDev * 10) / 10,
+      headPos:       +slouchDev.toFixed(3),
+      bodyLean:      +shoulderTiltDev.toFixed(3),
+      distance:      +headForwardDev.toFixed(3),
+      shoulderRound: +shoulderRoundScore.toFixed(3),
     },
-    rawFace: face,
+    landmarks,
   };
 }
 
@@ -188,19 +336,19 @@ function updatePostureUI(analysis) {
     detail.textContent = analysis.issues.join(' · ');
     badge.className = 'video-badge badge-bad'; badge.textContent = '⚠ FIX POSTURE';
   } else {
-    icon.textContent = '👤'; label.textContent = 'No Face'; label.style.color = 'var(--text-dim)';
-    detail.textContent = 'Make sure your face is visible';
+    icon.textContent = '👤'; label.textContent = 'No Pose'; label.style.color = 'var(--text-dim)';
+    detail.textContent = 'Make sure face and shoulders are visible';
     badge.className = 'video-badge badge-calibrating'; badge.textContent = 'SEARCHING…';
   }
 
   if (analysis.metrics) {
     const m = analysis.metrics;
-    $('scoreHead').textContent = (m.headPos > 0 ? '+' : '') + m.headPos + '%';
-    $('scoreHead').style.color = Math.abs(m.headPos) > CONFIG.SLOUCH_THRESHOLD ? 'var(--red)' : 'var(--green)';
-    $('scoreLean').textContent = (m.bodyLean > 0 ? '+' : '') + m.bodyLean + '%';
-    $('scoreLean').style.color = Math.abs(m.bodyLean) > CONFIG.SIDE_LEAN_THRESHOLD ? 'var(--red)' : 'var(--green)';
-    $('scoreDistance').textContent = (m.distance > 0 ? '+' : '') + m.distance + '%';
-    $('scoreDistance').style.color = m.distance > CONFIG.LEAN_FORWARD_THRESHOLD ? 'var(--red)' : 'var(--green)';
+    $('scoreHead').textContent     = (m.headPos  > 0 ? '+' : '') + m.headPos;
+    $('scoreHead').style.color     = m.headPos  > CONFIG.SLOUCH_THRESHOLD       ? 'var(--red)' : 'var(--green)';
+    $('scoreLean').textContent     = (m.bodyLean > 0 ? '+' : '') + m.bodyLean;
+    $('scoreLean').style.color     = m.bodyLean > CONFIG.SIDE_LEAN_THRESHOLD     ? 'var(--red)' : 'var(--green)';
+    $('scoreDistance').textContent = (m.distance > 0 ? '+' : '') + m.distance;
+    $('scoreDistance').style.color = m.distance > CONFIG.FORWARD_HEAD_THRESHOLD  ? 'var(--red)' : 'var(--green)';
   }
 
   updateDebug(analysis);
@@ -209,18 +357,25 @@ function updatePostureUI(analysis) {
 function updateDebug(analysis) {
   const dbg = $('debugContent');
   if (!dbg || $('debugPanel').classList.contains('hidden')) return;
-  const m = analysis.metrics || { headPos: 0, bodyLean: 0, distance: 0 };
+  const m   = analysis.metrics || {};
   const cal = state.calibration;
+  const statusColor = analysis.status === 'good' ? 'var(--green)' : analysis.status === 'bad' ? 'var(--red)' : 'var(--yellow)';
+
+  const faceMode = state.faceReady ? (cal?.faceCal ? '✓ hybrid' : '⚠ pose-only (no face cal)') : '✗ pose-only';
 
   dbg.innerHTML = `
-    <b>Method:</b> ${state.detectionMethod} | <b>Confidence:</b> ${analysis.rawFace?.confidence || '--'}<br>
-    <b>Status:</b> <span style="color:${analysis.status==='good'?'var(--green)':analysis.status==='bad'?'var(--red)':'var(--yellow)'}">${analysis.status.toUpperCase()}</span><br>
+    <b>Method:</b> ${state.detectionMethod}<br>
+    <b>Face:</b> ${faceMode}<br>
+    <b>Status:</b> <span style="color:${statusColor}">${analysis.status.toUpperCase()}</span><br>
     ─────────────────────<br>
-    <b>Head Y:</b> ${m.headPos}% <span style="color:var(--text-dim)">(thresh ±${CONFIG.SLOUCH_THRESHOLD}% of face-h)</span><br>
-    <b>Side X:</b> ${m.bodyLean}% <span style="color:var(--text-dim)">(thresh ±${CONFIG.SIDE_LEAN_THRESHOLD}% of face-w)</span><br>
-    <b>Dist Δ:</b> ${m.distance}% <span style="color:var(--text-dim)">(thresh +${CONFIG.LEAN_FORWARD_THRESHOLD}% of face-w)</span><br>
-    ${cal ? `─────────────────────<br><b>Cal:</b> (${Math.round(cal.centerX)},${Math.round(cal.centerY)}) ${Math.round(cal.faceWidth)}×${Math.round(cal.faceHeight)}` : ''}
-    ${analysis.rawFace ? `<br><b>Now:</b> (${Math.round(analysis.rawFace.centerX)},${Math.round(analysis.rawFace.centerY)}) ${Math.round(analysis.rawFace.width)}×${Math.round(analysis.rawFace.height)}` : ''}
+    <b>[Face] Slouch dev:</b> ${m.faceSlouchDev ?? '–'} <span style="color:var(--text-dim)">(thresh ${CONFIG.FACE_SLOUCH_THRESHOLD})</span><br>
+    <b>[Face] Turn dev:</b> ${m.faceTurnDev ?? '–'} <span style="color:var(--text-dim)">(turn suppress >${CONFIG.FACE_TURN_THRESHOLD})</span><br>
+    ─────────────────────<br>
+    <b>[Body] Shoulder drop:</b> ${m.headPos ?? '–'} <span style="color:var(--text-dim)">(thresh ${CONFIG.SLOUCH_THRESHOLD})</span><br>
+    <b>[Body] Shoulder tilt:</b> ${m.bodyLean ?? '–'} <span style="color:var(--text-dim)">(thresh ${CONFIG.SIDE_LEAN_THRESHOLD})</span><br>
+    <b>[Body] Head forward:</b> ${m.distance ?? '–'} <span style="color:var(--text-dim)">(thresh ${CONFIG.FORWARD_HEAD_THRESHOLD})</span><br>
+    <b>[Body] Shoulder round:</b> ${m.shoulderRound ?? '–'} <span style="color:var(--text-dim)">(thresh ${CONFIG.SHOULDER_ROUND_THRESHOLD})</span><br>
+    ${cal ? `─────────────────────<br><b>Cal sw:</b> ${cal.shoulderWidth.toFixed(3)} | <b>headH:</b> ${cal.headHeight.toFixed(3)}${cal.faceCal ? ` | <b>f2s:</b> ${cal.faceCal.faceToShoulderRatio.toFixed(3)}` : ''}` : ''}
   `;
 }
 
@@ -228,16 +383,25 @@ function updateTimerUI() {
   if (!state.sittingStartTime || state.paused) return;
   const elapsed = Date.now() - state.sittingStartTime;
   state.totalSittingMs = elapsed;
-  const hrs = Math.floor(elapsed / 3600000);
+  const hrs  = Math.floor(elapsed / 3600000);
   const mins = Math.floor((elapsed % 3600000) / 60000);
   const secs = Math.floor((elapsed % 60000) / 1000);
-  $('timerDisplay').textContent = String(hrs).padStart(2,'0') + ':' + String(mins).padStart(2,'0') + ':' + String(secs).padStart(2,'0');
+  $('timerDisplay').textContent = `${String(hrs).padStart(2,'0')}:${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
 
-  const stretchMs = CONFIG.STRETCH_INTERVAL_MIN * 60000;
+  const stretchMs   = CONFIG.STRETCH_INTERVAL_MIN * 60000;
+  const cycle       = Math.floor(elapsed / stretchMs);
   const cycleElapsed = elapsed % stretchMs;
-  $('stretchFill').style.width = (cycleElapsed / stretchMs * 100) + '%';
+
+  // Fire stretch reminder the moment the timer cycles — immediate, pause-aware
+  if (cycle > 0 && cycle !== state._lastStretchCycle) {
+    state._lastStretchCycle = cycle;
+    try { chrome.runtime.sendMessage({ type: 'STRETCH_NOW', sittingMin: Math.round(elapsed / 60000) }); } catch (_) {}
+    addLog('🧘', `Stretch break! You've been sitting ${Math.round(elapsed / 60000)} min.`);
+  }
+
+  $('stretchFill').style.width = `${(cycleElapsed / stretchMs) * 100}%`;
   const remaining = stretchMs - cycleElapsed;
-  $('timerSub').textContent = `Stretch break in ${Math.floor(remaining/60000)}:${String(Math.floor((remaining%60000)/1000)).padStart(2,'0')}`;
+  $('timerSub').textContent = `Stretch break in ${Math.floor(remaining / 60000)}:${String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0')}`;
 
   chrome.runtime.sendMessage({ type: 'UPDATE_SITTING', totalSittingMs: elapsed });
 }
@@ -264,34 +428,82 @@ function addLog(emoji, message) {
 }
 
 // ═══ DRAW OVERLAY ═══
-function drawOverlay(face) {
+// Skeleton connections: [from, to] using MediaPipe landmark indices
+const POSE_CONNECTIONS = [
+  [11,12],          // shoulder bar
+  [11,13],[13,15],  // left arm
+  [12,14],[14,16],  // right arm
+  [11,23],[12,24],  // torso sides
+  [23,24],          // hip bar
+];
+const KEY_POINTS = [0, 7, 8, 11, 12, 23, 24]; // nose, ears, shoulders, hips
+
+function drawOverlay(landmarks) {
   const canvas = $('overlay');
-  const video = $('webcam');
-  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  const video  = $('webcam');
+  canvas.width  = video.videoWidth;
+  canvas.height = video.videoHeight;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!face) return;
 
-  const mx = canvas.width - face.x - face.width;
+  const W = canvas.width, H = canvas.height;
   const isGood = state.currentPosture === 'good';
-  const color = isGood ? '#6ee7b7' : '#f87171';
+  const color  = isGood ? '#6ee7b7' : '#f87171';
 
-  ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.setLineDash([8,4]);
-  ctx.strokeRect(mx, face.y, face.width, face.height);
-  ctx.setLineDash([]);
+  // Mirror x so overlay matches the CSS-mirrored video display
+  const px = (lm) => (W - lm.x * W);
+  const py = (lm) => (lm.y * H);
 
-  const cx = mx + face.width/2, cy = face.y + face.height/2;
-  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fillStyle = color; ctx.fill();
-
-  if (state.calibration) {
-    const cal = state.calibration;
-    const calCX = canvas.width - cal.centerX;
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
-    ctx.beginPath(); ctx.moveTo(0, cal.centerY); ctx.lineTo(canvas.width, cal.centerY); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(calCX, 0); ctx.lineTo(calCX, canvas.height); ctx.stroke();
+  // ── Fixed calibrated face reference box ──
+  // Drawn at the calibrated position, not the live position.
+  // Shows where the face/head should be when posture is correct.
+  // Live face detection still runs for analysis; it's not drawn here.
+  if (state.calibration?.faceCal) {
+    const fc  = state.calibration.faceCal;
+    const bw  = fc.faceWidth  * W;
+    const bh  = fc.faceHeight * H;
+    const bcx = (1 - fc.faceCenterX) * W;  // mirrored X
+    const bcy = fc.faceCenterY * H;
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.strokeRect(bcx - bw / 2, bcy - bh / 2, bw, bh);
     ctx.setLineDash([]);
-    const calMX = canvas.width - (cal.centerX - cal.faceWidth/2) - cal.faceWidth;
-    ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.strokeRect(calMX, cal.centerY - cal.faceHeight/2, cal.faceWidth, cal.faceHeight);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '10px monospace';
+    ctx.fillText('calibrated', bcx - bw / 2 + 3, bcy - bh / 2 + 13);
+  }
+
+  if (!landmarks) return;
+
+  // ── MediaPipe skeleton ──
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([]);
+  for (const [a, b] of POSE_CONNECTIONS) {
+    const la = landmarks[a], lb = landmarks[b];
+    if ((la.visibility ?? 1) < 0.4 || (lb.visibility ?? 1) < 0.4) continue;
+    ctx.beginPath();
+    ctx.moveTo(px(la), py(la));
+    ctx.lineTo(px(lb), py(lb));
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = color;
+  for (const idx of KEY_POINTS) {
+    const lm = landmarks[idx];
+    if ((lm.visibility ?? 1) < 0.4) continue;
+    ctx.beginPath();
+    ctx.arc(px(lm), py(lm), idx === 0 ? 6 : 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Calibration shoulder reference line
+  if (state.calibration) {
+    const ls = landmarks[11], rs = landmarks[12];
+    const refY = ((ls.y + rs.y) / 2) * H;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1; ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(0, refY); ctx.lineTo(W, refY); ctx.stroke();
+    ctx.setLineDash([]);
   }
 }
 
@@ -301,21 +513,52 @@ async function detectionLoop() {
   const video = $('webcam');
   if (video.readyState < 2) return;
 
-  const face = await detectFace(video);
-  drawOverlay(face);
+  // Run both detectors in parallel each cycle
+  const [body, faceDetection] = await Promise.all([
+    detectPose(video),
+    detectFaceBox(video),
+  ]);
 
-  if (!face) {
-    updatePostureUI({ status: 'unknown', metrics: null, rawFace: null });
+  drawOverlay(body);
+
+  if (!body) {
+    updatePostureUI({ status: 'unknown', metrics: null });
+    $('postureDetail').textContent = 'No body detected — are you away?';
     state.currentPosture = 'unknown'; state.badPostureSince = null;
     return;
   }
-  if (!state.calibration) {
-    updatePostureUI({ status: 'unknown', metrics: null, rawFace: face });
-    $('postureDetail').textContent = 'Click "Calibrate" while sitting upright';
+
+  // Too far from camera check
+  const shoulderWidth = Math.abs(body[12].x - body[11].x);
+  if (shoulderWidth < CONFIG.MIN_SHOULDER_WIDTH) {
+    updatePostureUI({ status: 'unknown', metrics: null });
+    $('postureDetail').textContent = 'Too far from camera — move closer';
+    state.currentPosture = 'unknown'; state.badPostureSince = null;
     return;
   }
 
-  const analysis = analyzePosture(face);
+  if (!state.calibration) {
+    updatePostureUI({ status: 'unknown', metrics: null });
+    $('postureDetail').textContent = 'Click "Calibrate" to set your posture baseline';
+    $('calibInfo').textContent = '🪑 Sit upright, then click Calibrate';
+    return;
+  }
+
+  // Analyse body (MediaPipe) + face (tinyFaceDetector) and fuse
+  const bodyAnalysis = analyzePosture(body);
+  const faceAnalysis = analyzeFace(faceDetection, body);
+
+  // Face-based slouch replaces MediaPipe's shoulder-drop slouch (more robust)
+  // All other body signals (shoulder tilt, head forward, shoulder rounding) are kept
+  const bodyIssuesFiltered = bodyAnalysis.issues.filter(i => !i.startsWith('Slouching'));
+  const allIssues = [...bodyIssuesFiltered, ...faceAnalysis.issues];
+
+  const analysis = {
+    status: allIssues.length > 0 ? 'bad' : (bodyAnalysis.status === 'unknown' ? 'unknown' : 'good'),
+    issues: allIssues,
+    metrics: { ...bodyAnalysis.metrics, ...faceAnalysis.faceMetrics },
+  };
+
   updatePostureUI(analysis);
 
   if (analysis.status === 'bad') {
@@ -353,35 +596,88 @@ async function calibrate() {
   $('calibInfo').textContent = 'Hold still for 2 seconds…';
   $('btnCalibrate').disabled = true;
 
-  const samples = [];
+  // Collect pose + face samples in parallel
+  const poseSamples = [], faceSamples = [];
   for (let i = 0; i < 6; i++) {
-    const face = await detectFace(video);
-    if (face) samples.push(face);
+    const [pose, faceDetection] = await Promise.all([detectPose(video), detectFaceBox(video)]);
+    if (pose) poseSamples.push(pose);
+    if (faceDetection) faceSamples.push(faceDetection);
     await new Promise(r => setTimeout(r, 350));
   }
   $('btnCalibrate').disabled = false;
 
-  if (samples.length < 3) {
-    addLog('❌', 'Calibration failed — face not detected consistently');
-    $('calibInfo').textContent = 'Failed — ensure face is visible and well-lit.';
+  if (poseSamples.length < 3) {
+    addLog('❌', 'Calibration failed — ensure your upper body is fully visible');
+    $('calibInfo').textContent = 'Failed — make sure shoulders are visible and well-lit.';
     return;
   }
 
-  const avg = {
-    centerX: samples.reduce((s,f) => s+f.centerX, 0) / samples.length,
-    centerY: samples.reduce((s,f) => s+f.centerY, 0) / samples.length,
-    faceWidth: samples.reduce((s,f) => s+f.width, 0) / samples.length,
-    faceHeight: samples.reduce((s,f) => s+f.height, 0) / samples.length,
-    frameW: video.videoWidth, frameH: video.videoHeight,
+  // Average each landmark across all pose samples
+  const avgLM = (idx) => ({
+    x: poseSamples.reduce((s, l) => s + l[idx].x, 0) / poseSamples.length,
+    y: poseSamples.reduce((s, l) => s + l[idx].y, 0) / poseSamples.length,
+    z: poseSamples.reduce((s, l) => s + l[idx].z, 0) / poseSamples.length,
+  });
+
+  const nose = avgLM(0);
+  const ls   = avgLM(11); // left shoulder
+  const rs   = avgLM(12); // right shoulder
+  const lh   = avgLM(23); // left hip
+  const rh   = avgLM(24); // right hip
+  const le   = avgLM(7);  // left ear
+  const re   = avgLM(8);  // right ear
+
+  const shoulderMidY     = (ls.y + rs.y) / 2;
+  const shoulderMidZ     = (ls.z + rs.z) / 2;
+  const shoulderWidth    = Math.abs(rs.x - ls.x) || 0.01;
+  const hipMidY          = (lh.y + rh.y) / 2;
+  const torsoRatio       = (hipMidY - shoulderMidY) / shoulderWidth;
+  const earMidZ          = (le.z + re.z) / 2;
+  const earShoulderZDiff = (earMidZ - shoulderMidZ) / shoulderWidth;
+
+  // Average face bounding box across face samples (null if face not detected)
+  let faceCal = null;
+  if (faceSamples.length >= 3) {
+    const vw = video.videoWidth  || 640;
+    const vh = video.videoHeight || 480;
+    const avgCX = faceSamples.reduce((s, d) => s + (d.box.x + d.box.width  / 2) / vw, 0) / faceSamples.length;
+    const avgCY = faceSamples.reduce((s, d) => s + (d.box.y + d.box.height / 2) / vh, 0) / faceSamples.length;
+    const avgFW = faceSamples.reduce((s, d) => s + d.box.width  / vw, 0) / faceSamples.length;
+    const avgFH = faceSamples.reduce((s, d) => s + d.box.height / vh, 0) / faceSamples.length;
+    faceCal = {
+      faceCenterX:         avgCX,
+      faceCenterY:         avgCY,  // needed to draw the fixed reference box
+      faceWidth:           avgFW,
+      faceHeight:          avgFH,
+      faceToShoulderRatio: (shoulderMidY - avgCY) / shoulderWidth,
+    };
+    addLog('👤', `Face calibrated — faceToShoulder: ${faceCal.faceToShoulderRatio.toFixed(3)}`);
+  } else {
+    addLog('⚠️', 'Face not detected during calibration — using pose-only slouch detection');
+  }
+
+  const calData = {
+    headHeight:      (shoulderMidY - nose.y) / shoulderWidth,
+    shoulderTilt:    (ls.y - rs.y) / shoulderWidth,
+    headForwardZ:    (shoulderMidZ - nose.z) / shoulderWidth,
+    torsoRatio,
+    shoulderWidth,
+    shoulderMidY,
+    earShoulderZDiff,
+    faceCal,  // null if face was not visible during calibration
   };
 
-  state.calibration = avg;
+  state.calibrations.sitting = calData;
+  state.calibration = calData;
+
+  chrome.storage.local.set({ calibrations: state.calibrations });
+
   state.phase = 'monitoring';
   state.badPostureSince = null;
   state.lastAlertTime = 0;
 
-  $('calibInfo').innerHTML = `<strong>Calibrated!</strong> Ref: (${Math.round(avg.centerX)},${Math.round(avg.centerY)}), ${Math.round(avg.faceWidth)}×${Math.round(avg.faceHeight)}`;
-  addLog('✅', 'Calibration complete — now monitoring!');
+  $('calibInfo').innerHTML = `<strong>🪑 Calibrated!</strong> SW: ${shoulderWidth.toFixed(3)} · Torso: ${torsoRatio.toFixed(3)}${faceCal ? ' · Face ✓' : ''}`;
+  addLog('✅', 'Posture calibrated!');
 
   const d = await chrome.storage.local.get(['waterIntervalMin','stretchIntervalMin','waterCount','waterGoal']);
   CONFIG.STRETCH_INTERVAL_MIN = d.stretchIntervalMin || 30;
@@ -412,14 +708,22 @@ async function startWebcam() {
 
     addLog('🎥', 'Webcam connected');
     initAudio();
-    await initDetector();
+    await Promise.all([initDetector(), initFaceDetector()]);
 
     state.detectionTimer = setInterval(detectionLoop, CONFIG.DETECTION_INTERVAL_MS);
     setInterval(updateTimerUI, 1000);
 
-    const data = await chrome.storage.local.get(['waterCount','waterGoal']);
+    const data = await chrome.storage.local.get(['waterCount', 'waterGoal', 'calibrations']);
     state.waterCount = data.waterCount || 0;
-    state.waterGoal = data.waterGoal || 8;
+    state.waterGoal  = data.waterGoal  || 8;
+
+    // Restore saved sitting calibration
+    if (data.calibrations?.sitting) {
+      state.calibrations.sitting = data.calibrations.sitting;
+      state.calibration = data.calibrations.sitting;
+      addLog('💾', 'Restored sitting calibration');
+    }
+
     updateWaterUI();
   } catch (err) {
     console.error('Webcam error:', err);
