@@ -79,6 +79,6 @@ Click **🔧 Debug** in the monitor dashboard to see live detection metrics:
 ## Tech Stack
 - Vanilla JS + HTML/CSS — no frameworks
 - [face-api.js](https://github.com/justadudewhohacks/face-api.js) (TinyFaceDetector) — face bounding box, slouch detection
-- [MediaPipe Pose](https://google.github.io/mediapipe/solutions/pose) — 33-landmark body skeleton, shoulder/head signals
+- [MediaPipe Pose](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/pose.md) — 33-landmark body skeleton, shoulder/head signals
 - Chrome Extension Manifest V3
 - Chrome APIs: `storage`, `alarms`, `notifications`
